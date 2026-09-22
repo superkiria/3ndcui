@@ -79,6 +79,17 @@ function Icon({
   );
 }
 
+function Availability({ available }: { available: boolean }) {
+  return (
+    <span className={available ? "availability" : "availability unavailable"}>
+      <span className="availability-symbol" aria-hidden="true">
+        {available ? "✓" : "✕"}
+      </span>
+      {available ? "Доступен" : "Недоступен"}
+    </span>
+  );
+}
+
 function InstanceInfo({ instance }: { instance: Instance }) {
   return (
     <div
@@ -91,17 +102,10 @@ function InstanceInfo({ instance }: { instance: Instance }) {
         </span>
       </div>
       <div className="instance-meta">
-        <span
-          className={
-            instance.available ? "availability" : "availability unavailable"
-          }
-        >
-          <i />
-          {instance.available ? "Доступен" : "Недоступен"}
-        </span>
+        <Availability available={instance.available} />
         {instance.role === "replica" && instance.available && (
           <span className={instance.lag > 1000 ? "lag lag-warning" : "lag"}>
-            <span className="sr-only">Отставание: </span>
+            <span>Отставание: </span>
             {instance.lag} мс
           </span>
         )}
@@ -276,6 +280,60 @@ function App() {
 
   return (
     <main className="app-shell">
+      <section className="demo-section" aria-labelledby="demo-title">
+        <div className="demo-controls">
+          <h2 id="demo-title">Управление демо</h2>
+          <div
+            className="scenario-buttons"
+            role="group"
+            aria-label="Выбрать демо-сценарий"
+          >
+            {scenarios.map((item) => (
+              <button
+                key={item.id}
+                className={`scenario-button ${scenario === item.id ? "active" : ""}`}
+                aria-pressed={scenario === item.id}
+                onClick={() => loadScenario(item.id)}
+                disabled={busy}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+          <label className="failure-toggle">
+            <input
+              type="checkbox"
+              checked={failNext}
+              onChange={(event) => setFailNext(event.target.checked)}
+              disabled={busy}
+            />
+            <span>
+              Следующее переключение
+              <br className="wide-break" /> завершится ошибкой
+            </span>
+          </label>
+          <button
+            className="button secondary reset-button"
+            onClick={() => loadScenario("healthy", true)}
+            disabled={busy}
+            title={busy ? "Дождитесь завершения операции" : undefined}
+          >
+            <Icon name="reset" />
+            Сбросить демо
+          </button>
+        </div>
+        <div className="demo-hint">
+          <span>
+            {busy
+              ? "Выполняется симуляция. Сценарии, повторное переключение и сброс доступны после завершения."
+              : "Сценарии загружают исходные данные и очищают историю. Проблемы показаны в G01."}
+          </span>
+          <button className="text-button" onClick={() => openGroup("G01")}>
+            Открыть G01 <Icon name="arrow" size={15} />
+          </button>
+        </div>
+      </section>
+      <hr className="demo-divider" />
       <header className="page-header">
         <div>
           <div className="title-line">
@@ -286,15 +344,6 @@ function App() {
             </span>
           </div>
         </div>
-        <button
-          className="button secondary reset-button"
-          onClick={() => loadScenario("healthy", true)}
-          disabled={busy}
-          title={busy ? "Дождитесь завершения операции" : undefined}
-        >
-          <Icon name="reset" />
-          Сбросить демо
-        </button>
       </header>
 
       <section className="summary" aria-label="Сводка по всей системе">
@@ -335,51 +384,6 @@ function App() {
             </div>
           </div>
         ))}
-      </section>
-
-      <section className="demo-section" aria-labelledby="demo-title">
-        <div className="demo-controls">
-          <h2 id="demo-title">Демо-сценарии</h2>
-          <div
-            className="scenario-buttons"
-            role="group"
-            aria-label="Выбрать демо-сценарий"
-          >
-            {scenarios.map((item) => (
-              <button
-                key={item.id}
-                className={`scenario-button ${scenario === item.id ? "active" : ""}`}
-                aria-pressed={scenario === item.id}
-                onClick={() => loadScenario(item.id)}
-                disabled={busy}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-          <label className="failure-toggle">
-            <input
-              type="checkbox"
-              checked={failNext}
-              onChange={(event) => setFailNext(event.target.checked)}
-              disabled={busy}
-            />
-            <span>
-              Следующее переключение
-              <br className="wide-break" /> завершится ошибкой
-            </span>
-          </label>
-        </div>
-        <div className="demo-hint">
-          <span>
-            {busy
-              ? "Выполняется симуляция. Сценарии, повторное переключение и сброс доступны после завершения."
-              : "Сценарии загружают исходные данные и очищают историю. Проблемы показаны в G01."}
-          </span>
-          <button className="text-button" onClick={() => openGroup("G01")}>
-            Открыть G01 <Icon name="arrow" size={15} />
-          </button>
-        </div>
       </section>
 
       <section className="groups-section" aria-labelledby="groups-title">
@@ -459,7 +463,12 @@ function App() {
                       </button>
                     </th>
                     {item.instances.map((instance) => (
-                      <td key={instance.id}>
+                      <td
+                        key={instance.id}
+                        className={
+                          !instance.available ? "unavailable-cell" : undefined
+                        }
+                      >
                         <InstanceInfo instance={instance} />
                       </td>
                     ))}
@@ -620,26 +629,22 @@ function App() {
                   <span className="step-number">1</span>Текущее состояние
                 </h3>
                 <GroupStatus group={group} />
-                <div className="current-master">
+                <div
+                  className={`current-master ${!master.available ? "unavailable-cell" : ""}`}
+                >
                   <span className="eyebrow">Текущий мастер</span>
                   <strong>
                     №{master.id} <span>·</span> ЦОД {master.dc}
                   </strong>
-                  <span
-                    className={
-                      master.available
-                        ? "availability"
-                        : "availability unavailable"
-                    }
-                  >
-                    <i />
-                    {master.available ? "Доступен" : "Недоступен"}
-                  </span>
+                  <Availability available={master.available} />
                 </div>
                 <h3 className="panel-section-title">Экземпляры группы</h3>
                 <div className="panel-instances">
                   {group.instances.map((instance) => (
-                    <div className="panel-instance" key={instance.id}>
+                    <div
+                      className={`panel-instance ${!instance.available ? "unavailable-cell" : ""}`}
+                      key={instance.id}
+                    >
                       <span className="dc-label">ЦОД {instance.dc}</span>
                       <InstanceInfo instance={instance} />
                     </div>
