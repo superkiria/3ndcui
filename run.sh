@@ -13,7 +13,7 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
 fi
 
 if [[ ! -d node_modules ]] || ! npm ls --depth=0 --silent >/dev/null 2>&1; then
-  npm ci
+  npm install
 fi
 
 exec npm run dev -- "$@"
