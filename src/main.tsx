@@ -4,13 +4,14 @@ import {
   centers,
   createGroups,
   bulkMoveBlockers,
+  groupsMasteredIn,
   ineligibleReason,
   isProblematic,
   matchesSearch,
   setReplicaEnabled,
   switchMaster,
 } from "./model";
-import type { DataCenter, Group, Instance, Scenario } from "./model";
+import type { BulkDestinations, DataCenter, Group, Instance, Scenario } from "./model";
 import "./styles.css";
 
 type Operation = {
@@ -34,7 +35,7 @@ type SimpleEvent = {
   stage?: number;
 };
 type HistoryEntry = Operation | SimpleEvent;
-type BulkProgress = { id: number; source: DataCenter; destination: DataCenter; groupIds: string[]; completed: number; stage: "check" | "moving" | "done"; step: number };
+type BulkProgress = { id: number; source: DataCenter; destinations: BulkDestinations; groupIds: string[]; completed: number; stage: "check" | "moving" | "done"; step: number };
 type ReplicaProgress = { id: number; group: string; instanceId: number; instanceDc: DataCenter; enabled: boolean; stage: number; status: "running" | "success" };
 const statuses = {
   running: "Выполняется",
@@ -49,6 +50,7 @@ const stages = [
   "Завершение",
 ];
 const replicaStages = ["Предварительная проверка", "Публикация карты распределения", "Проверка после изменения"];
+const instanceNumber = (id: number) => String(id).padStart(2, "0");
 const randomStepDuration = () => 3000 + Math.floor(Math.random() * 4001);
 function stageOffsets(count: number): number[] {
   const offsets = [0];
@@ -126,7 +128,7 @@ function InstanceInfo({ instance }: { instance: Instance }) {
       className={`instance ${!instance.available ? "instance-offline" : ""}`}
     >
       <div className="instance-top">
-        <span className="instance-id">№{instance.id}</span>
+        <span className="instance-id">№{instanceNumber(instance.id)}</span>
         <span className={`role ${instance.role}`}>
           {instance.role === "master" ? "Мастер" : "Реплика"}
         </span>
@@ -196,8 +198,8 @@ function App() {
   const [onlyProblems, setOnlyProblems] = useState(false);
   const [failNext, setFailNext] = useState(false);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [destination, setDestination] = useState<DataCenter>("A");
-  const [source, setSource] = useState<DataCenter>("B");
+  const [destinations, setDestinations] = useState<BulkDestinations>({});
+  const [source, setSource] = useState<DataCenter | "">("");
   const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
   const [replicaProgress, setReplicaProgress] = useState<ReplicaProgress | null>(null);
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
@@ -225,10 +227,9 @@ function App() {
   const offlineCount = groups
     .flatMap((item) => item.instances)
     .filter((instance) => !instance.available).length;
-  const bulkBlockers = bulkMoveBlockers(groups, source, destination);
-  const groupsToMove = groups.filter((item) =>
-    item.instances.some((instance) => instance.dc === source && instance.role === "master"),
-  );
+  const bulkBlockers = source ? bulkMoveBlockers(groups, source, destinations) : [];
+  const groupsToMove = source ? groupsMasteredIn(groups, source) : [];
+  const selectedDestinations = groupsToMove.filter((item) => destinations[item.id]).length;
 
   useEffect(() => {
     if (selectedGroup && !dialog.current?.open) dialog.current?.showModal();
@@ -253,14 +254,14 @@ function App() {
     setHistory([]);
     setOperation(null);
     setBulkProgress(null);
+    setDestinations({});
     setReplicaProgress(null);
     closePanel();
     if (reset) {
       setSearch("");
       setOnlyProblems(false);
       setFailNext(false);
-      setDestination("A");
-      setSource("B");
+      setSource("");
     }
     setNotice(
       reset
@@ -275,7 +276,7 @@ function App() {
     );
   }
   function toggleReplica(instance: Instance) {
-    if (locked.current || !group || group.mode !== "asynchronous" || instance.role !== "replica") return;
+    if (locked.current || !group || instance.role !== "replica") return;
     locked.current = true;
     const enabled = !instance.replicationEnabled;
     const started: ReplicaProgress = { id: ++sequence.current, group: group.id, instanceId: instance.id, instanceDc: instance.dc, enabled, stage: 0, status: "running" };
@@ -286,11 +287,11 @@ function App() {
     const event: SimpleEvent = {
       kind: "replica", id: started.id,
       time: new Date().toLocaleTimeString("ru-RU"), group: group.id,
-      description: `Репликация №${instance.id} в ЦОД ${instance.dc}: ${enabled ? "включение" : "отключение"}`,
+      description: `Репликация №${instanceNumber(instance.id)} в ЦОД ${instance.dc}: ${enabled ? "включение" : "отключение"}`,
       status: "running", stage: 0,
     };
     setHistory((items) => [event, ...items]);
-    setNotice(`${group.id}: начата симуляция ${enabled ? "включения" : "отключения"} репликации №${instance.id}.`);
+    setNotice(`${group.id}: начата симуляция ${enabled ? "включения" : "отключения"} репликации №${instanceNumber(instance.id)}.`);
     const offsets = stageOffsets(replicaStages.length);
     timers.current = [
       setTimeout(() => {
@@ -305,28 +306,29 @@ function App() {
       setTimeout(() => {
         setReplicaProgress({ ...started, stage: replicaStages.length, status: "success" });
         setHistory((items) => items.map((item) => item.id === started.id ? { ...event, status: "success", stage: replicaStages.length,
-          description: `Репликация №${instance.id} в ЦОД ${instance.dc}: ${enabled ? "включена" : "отключена"}` } : item));
+          description: `Репликация №${instanceNumber(instance.id)} в ЦОД ${instance.dc}: ${enabled ? "включена" : "отключена"}` } : item));
         locked.current = false;
-        setNotice(`${group.id}: репликация №${instance.id} ${enabled ? "включена" : "отключена"}.`);
+        setNotice(`${group.id}: репликация №${instanceNumber(instance.id)} ${enabled ? "включена" : "отключена"}.`);
       }, offsets[3]),
     ];
   }
   function moveAll() {
-    if (locked.current || bulkBlockers.length || !groupsToMove.length) return;
+    if (locked.current || !source || bulkBlockers.length || !groupsToMove.length) return;
     locked.current = true;
     const started: BulkProgress = {
-      id: ++sequence.current, source, destination,
+      id: ++sequence.current, source, destinations: { ...destinations },
       groupIds: groupsToMove.map((item) => item.id), completed: 0, stage: "check", step: 0,
     };
     setBulkProgress(started);
+    const routes = started.groupIds.map((id) => `${id} → ЦОД ${started.destinations[id]}`).join(", ");
     const event: SimpleEvent = {
       kind: "bulk", id: started.id,
-      time: new Date().toLocaleTimeString("ru-RU"), group: "Все группы",
-      description: `ЦОД ${source} → ЦОД ${destination}: 0 из ${started.groupIds.length} групп`,
+      time: new Date().toLocaleTimeString("ru-RU"), group: "Массовое перемещение",
+      description: `Из ЦОД ${source}: ${routes}. 0 из ${started.groupIds.length} групп`,
       status: "running",
     };
     setHistory((items) => [event, ...items]);
-    setNotice(`Проверка ${started.groupIds.length} групп перед перемещением из ЦОД ${source} в ЦОД ${destination}.`);
+    setNotice(`Проверка ${started.groupIds.length} групп перед перемещением из ЦОД ${source} по выбранным маршрутам.`);
     let groupStart = randomStepDuration();
     timers.current = started.groupIds.flatMap((groupId, index) => {
       const offsets = stageOffsets(stages.length);
@@ -337,19 +339,19 @@ function App() {
         }
         setGroups((items) => {
           const currentGroup = items.find((item) => item.id === groupId);
-          const target = currentGroup?.instances.find((item) => item.dc === destination);
+          const target = currentGroup?.instances.find((item) => item.dc === started.destinations[groupId]);
           return target ? switchMaster(items, groupId, target.id) : items;
         });
         const completed = index + 1;
         const done = completed === started.groupIds.length;
         setBulkProgress({ ...started, completed, stage: done ? "done" : "moving", step: done ? stages.length : 0 });
         setHistory((items) => items.map((item) => item.id === started.id ? {
-          ...event, description: `ЦОД ${source} → ЦОД ${destination}: ${completed} из ${started.groupIds.length} групп`,
+          ...event, description: `Из ЦОД ${source}: ${routes}. ${completed} из ${started.groupIds.length} групп`,
           status: done ? "success" : "running",
         } : item));
         if (done) {
           locked.current = false;
-          setNotice(`Перемещены мастера ${started.groupIds.length} групп из ЦОД ${source} в ЦОД ${destination}.`);
+          setNotice(`Перемещены мастера ${started.groupIds.length} групп из ЦОД ${source} по выбранным маршрутам.`);
         }
       }, groupStart + offset));
       groupStart += offsets[stages.length];
@@ -415,7 +417,7 @@ function App() {
         locked.current = false;
         setTargetId(null);
         setNotice(
-          `${started.group}: мастер переключён на №${started.target.id} в ЦОД ${started.target.dc}.`,
+          `${started.group}: мастер переключён на №${instanceNumber(started.target.id)} в ЦОД ${started.target.dc}.`,
         );
       }, offsets[stages.length]),
     );
@@ -492,36 +494,57 @@ function App() {
       <section className="bulk-section" aria-labelledby="bulk-title">
         <div>
           <h2 id="bulk-title">Переместить мастера между ЦОД</h2>
-          <p>Мастера групп из исходного ЦОД переходят в целевой. Перед началом проверяются все затронутые группы.</p>
+          <p>Выберите исходный ЦОД, затем целевой ЦОД для каждого мастера. Перед началом проверяются все затронутые группы.</p>
         </div>
         <div className="bulk-controls">
-          <label htmlFor="bulk-source">Из ЦОД</label>
-          <select id="bulk-source" value={source} disabled={busy}
-            onChange={(event) => { setSource(event.target.value as DataCenter); setBulkProgress(null); }}>
-            {centers.map((dc) => <option key={dc} value={dc}>ЦОД {dc}</option>)}
+          <label htmlFor="bulk-source">1. Из ЦОД</label>
+          <select id="bulk-source" className={source ? `dc-color dc-${source}` : undefined} value={source} disabled={busy}
+            onChange={(event) => { setSource(event.target.value as DataCenter | ""); setDestinations({}); setBulkProgress(null); }}>
+            <option value="">Выберите исходный ЦОД</option>
+            {centers.map((dc) => <option className={`dc-color dc-${dc}`} key={dc} value={dc}>ЦОД {dc}</option>)}
           </select>
-          <label htmlFor="bulk-destination">В ЦОД</label>
-          <select id="bulk-destination" value={destination} disabled={busy}
-            onChange={(event) => { setDestination(event.target.value as DataCenter); setBulkProgress(null); }}>
-            {centers.map((dc) => <option key={dc} value={dc}>ЦОД {dc}</option>)}
-          </select>
-          <button className="button primary" disabled={busy || bulkBlockers.length > 0 || groupsToMove.length === 0}
-            onClick={moveAll}>Переместить мастера</button>
         </div>
-        <p className={bulkBlockers.length ? "bulk-feedback inline-error" : "bulk-feedback"}>
-          {bulkBlockers.length
-            ? `Перемещение недоступно: ${bulkBlockers.join("; ")}.`
-            : groupsToMove.length === 0
-              ? `В ЦОД ${source} сейчас нет мастеров.`
-              : `${groupsToMove.length} групп будут переключены из ЦОД ${source} в ЦОД ${destination}.`}
-        </p>
+        {!bulkProgress && groupsToMove.length > 0 && <div className="bulk-plan">
+          <h3>2. Куда переместить каждого мастера</h3>
+          <div className="bulk-routes">
+            {groupsToMove.map((item) => {
+              const currentMaster = item.instances.find((instance) => instance.role === "master")!;
+              const blockers = source ? bulkMoveBlockers([item], source, destinations) : [];
+              return <div className="bulk-route" key={item.id}>
+                <div><strong>{item.id}</strong><p>Мастер №{instanceNumber(currentMaster.id)} · ЦОД {source}</p></div>
+                <div className="bulk-controls">
+                  <label htmlFor={`bulk-destination-${item.id}`}>В ЦОД для {item.id}</label>
+                  <select id={`bulk-destination-${item.id}`} className={destinations[item.id] ? `dc-color dc-${destinations[item.id]}` : undefined} value={destinations[item.id] ?? ""} disabled={busy}
+                    onChange={(event) => {
+                      const dc = event.target.value as DataCenter | "";
+                      setDestinations((current) => ({ ...current, [item.id]: dc || undefined }));
+                    }}>
+                    <option value="">Выберите целевой ЦОД</option>
+                    {item.instances.filter((instance) => instance.dc !== source).map((instance) =>
+                      <option className={`dc-color dc-${instance.dc}`} key={instance.dc} value={instance.dc}>ЦОД {instance.dc} · №{instanceNumber(instance.id)}{ineligibleReason(instance) ? ` — ${ineligibleReason(instance)}` : ""}</option>,
+                    )}
+                  </select>
+                </div>
+                {destinations[item.id] && blockers.length > 0 && <p className="inline-error bulk-route-error">{blockers.join("; ")}</p>}
+              </div>;
+            })}
+          </div>
+          <div className="bulk-start">
+            <p>{selectedDestinations === groupsToMove.length
+              ? bulkBlockers.length ? "Исправьте маршруты: одна или несколько групп не готовы к перемещению." : `Назначения выбраны для всех групп (${groupsToMove.length}). Можно начать перемещение.`
+              : `Выбраны назначения: ${selectedDestinations} из ${groupsToMove.length}. Укажите целевой ЦОД для каждого мастера.`}</p>
+            <button className="button primary" disabled={busy || bulkBlockers.length > 0}
+              onClick={moveAll}>3. Начать перемещение</button>
+          </div>
+        </div>}
+        {!bulkProgress && source && groupsToMove.length === 0 && <p className="bulk-feedback">В ЦОД {source} сейчас нет мастеров.</p>}
         {bulkProgress && <div className="bulk-progress" role="status" aria-live="polite">
           <strong>{bulkProgress.stage === "check" ? "Проверка всех целевых реплик" :
             bulkProgress.stage === "done" ? "Перемещение завершено" :
               `${bulkProgress.groupIds[bulkProgress.completed]}: ${bulkProgress.completed} из ${bulkProgress.groupIds.length} групп перемещено`}</strong>
           <ol className="bulk-group-list">
             {bulkProgress.groupIds.map((id, index) => <li key={id} className={index < bulkProgress.completed ? "completed" : index === bulkProgress.completed && bulkProgress.stage === "moving" ? "current" : ""}>
-              <span>{id}</span><span>{index < bulkProgress.completed ? "Готово" :
+              <span>{id} · ЦОД {bulkProgress.source} → ЦОД {bulkProgress.destinations[id]}</span><span>{index < bulkProgress.completed ? "Готово" :
                 index === bulkProgress.completed && bulkProgress.stage === "moving" ? stages[bulkProgress.step] : "Ожидание"}</span>
             </li>)}
           </ol>
@@ -621,7 +644,7 @@ function App() {
                 <tr>
                   <th scope="col">Группа</th>
                   {centers.map((dc) => (
-                    <th scope="col" key={dc}>
+                    <th scope="col" className={`dc-color dc-${dc}`} key={dc}>
                       ЦОД {dc}
                     </th>
                   ))}
@@ -647,7 +670,6 @@ function App() {
                         {item.id}
                         <span aria-hidden="true">›</span>
                       </button>
-                      <small className="group-mode">{item.mode === "asynchronous" ? "Асинхронный" : "Синхронный"}</small>
                     </th>
                     {item.instances.map((instance) => (
                       <td
@@ -728,9 +750,9 @@ function App() {
                       <td>
                         {item.kind === "switchover" ? (
                           <div className="history-route">
-                            <span>№{item.source.id} · ЦОД {item.source.dc}</span>
+                            <span>№{instanceNumber(item.source.id)} · ЦОД {item.source.dc}</span>
                             <Icon name="arrow" size={16} />
-                            <span>№{item.target.id} · ЦОД {item.target.dc}</span>
+                            <span>№{instanceNumber(item.target.id)} · ЦОД {item.target.dc}</span>
                           </div>
                         ) : <span>{item.description}{item.kind === "replica" && item.status === "running" && item.stage !== undefined
                           ? ` · ${replicaStages[item.stage]}` : ""}</span>}
@@ -800,7 +822,6 @@ function App() {
               <div>
                 <span className="eyebrow">Репликационная группа</span>
                 <h2 id="panel-title">{group.id}</h2>
-                <span className="panel-mode">{group.mode === "asynchronous" ? "Асинхронный шард" : "Синхронный шард"}</span>
               </div>
               <button
                 className="icon-button close-panel"
@@ -822,7 +843,7 @@ function App() {
                 >
                   <span className="eyebrow">Текущий мастер</span>
                   <strong>
-                    №{master.id} <span>·</span> ЦОД {master.dc}
+                    №{instanceNumber(master.id)} <span>·</span> ЦОД {master.dc}
                   </strong>
                   <Availability available={master.available} />
                 </div>
@@ -835,8 +856,8 @@ function App() {
                     >
                       <span className="dc-label">ЦОД {instance.dc}</span>
                       <InstanceInfo instance={instance} />
-                      {group.mode === "asynchronous" && instance.role === "replica" && (
-                        <button className="button secondary replica-button"
+                      {instance.role === "replica" && (
+                        <button className="button primary replica-button"
                           disabled={busy}
                           onClick={() => toggleReplica(instance)}>
                           {instance.replicationEnabled ? "Отключить репликацию" : "Включить репликацию"}
@@ -845,7 +866,7 @@ function App() {
                     </div>
                   ))}
                 </div>
-                {group.mode === "asynchronous" && <p className="replica-hint">Отключённая реплика остаётся в группе, но не может стать мастером или целью перемещения.</p>}
+                <p className="replica-hint">Отключённая реплика остаётся в группе, но не может стать мастером или целью перемещения.</p>
               </section>
               </div>
               <div className="panel-actions">
@@ -854,10 +875,10 @@ function App() {
                     ? `${shownReplicaOperation.enabled ? "Включение" : "Отключение"} репликации`
                     : `Репликация ${shownReplicaOperation.enabled ? "включена" : "отключена"}`}</h3>
                   <p className="simulation-note">Симуляция операции · {shownReplicaOperation.group}</p>
-                  <p className="operation-route">Реплика №{shownReplicaOperation.instanceId} · ЦОД {shownReplicaOperation.instanceDc}</p>
+                  <p className="operation-route">Реплика №{instanceNumber(shownReplicaOperation.instanceId)} · ЦОД {shownReplicaOperation.instanceDc}</p>
                   <StageList labels={replicaStages} step={shownReplicaOperation.stage} status={shownReplicaOperation.status} />
                   {shownReplicaOperation.status === "success" && <p className="success-box">
-                    Репликация №{shownReplicaOperation.instanceId} {shownReplicaOperation.enabled ? "включена" : "отключена"}.
+                    Репликация №{instanceNumber(shownReplicaOperation.instanceId)} {shownReplicaOperation.enabled ? "включена" : "отключена"}.
                   </p>}
                   {shownReplicaOperation.status === "running" ? <p className="muted">
                     Повторное изменение недоступно до завершения. Панель можно закрыть — операция продолжится.
@@ -919,7 +940,7 @@ function App() {
                           return (
                             <label
                               key={instance.id}
-                              className={`target-option ${targetId === instance.id ? "selected" : ""} ${reason ? "disabled" : ""}`}
+                              className={`target-option dc-color dc-${instance.dc} ${targetId === instance.id ? "selected" : ""} ${reason ? "disabled" : ""}`}
                             >
                               <input
                                 type="radio"
@@ -931,7 +952,7 @@ function App() {
                               />
                               <span>
                                 <strong>
-                                  №{instance.id} · ЦОД {instance.dc}
+                                  №{instanceNumber(instance.id)} · ЦОД {instance.dc}
                                 </strong>
                                 <small className={reason ? "inline-error" : ""}>
                                   {reason ||
@@ -986,8 +1007,8 @@ function App() {
                       <div className="confirmation-route">
                         <span className="eyebrow">Будет выполнено</span>
                         <p>
-                          {group.id}: мастер №{master.id} в ЦОД {master.dc} → №
-                          {target.id} в ЦОД {target.dc}
+                          {group.id}: мастер №{instanceNumber(master.id)} в ЦОД {master.dc} → №
+                          {instanceNumber(target.id)} в ЦОД {target.dc}
                         </p>
                       </div>
                     )}
@@ -1032,8 +1053,8 @@ function App() {
                     Симуляция операции · {shownOperation.group}
                   </p>
                   <p className="operation-route">
-                    №{shownOperation.source.id} · ЦОД {shownOperation.source.dc}{" "}
-                    → №{shownOperation.target.id} · ЦОД{" "}
+                    №{instanceNumber(shownOperation.source.id)} · ЦОД {shownOperation.source.dc}{" "}
+                    → №{instanceNumber(shownOperation.target.id)} · ЦОД{" "}
                     {shownOperation.target.dc}
                   </p>
                   <StageList labels={stages} step={shownOperation.stage} status={shownOperation.status} />
@@ -1044,7 +1065,7 @@ function App() {
                   )}
                   {shownOperation.status === "success" && (
                     <p className="success-box">
-                      Новый мастер — №{shownOperation.target.id} в ЦОД{" "}
+                      Новый мастер — №{instanceNumber(shownOperation.target.id)} в ЦОД{" "}
                       {shownOperation.target.dc}. Предыдущий мастер стал
                       репликой.
                     </p>

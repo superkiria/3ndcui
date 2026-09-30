@@ -15,7 +15,7 @@ This is a Russian language, browser only prototype for demonstrating shard maste
 ## Current behavior to preserve
 
 - There are 12 groups (`G01`–`G12`), with one instance per data center and exactly one master per group. The initial 36 instances have four masters in each data center.
-- Odd-numbered groups are asynchronous; their replicas can have replication enabled or disabled. A disabled replica cannot become master. Even-numbered groups are synchronous.
+- All groups follow the same rules; their replicas can have replication enabled or disabled. A disabled replica cannot become master.
 - A planned switchover requires an available current master and an available target replica with replication enabled and lag at most 1000 ms. Failed preliminary checks leave roles unchanged. Only one timed operation runs at once.
 - Bulk relocation checks every group before moving any master. A blocked target leaves all groups unchanged. Groups already mastered in the destination stay as they are.
 - Demo scenarios replace the dataset and clear history. Reset also clears search, the problem filter, the simulated failure toggle, and the open panel. State and history live only in browser memory.

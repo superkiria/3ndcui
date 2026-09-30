@@ -7,7 +7,7 @@ export type Instance = {
   lag: number;
   replicationEnabled: boolean;
 };
-export type Group = { id: string; mode: "synchronous" | "asynchronous"; instances: Instance[] };
+export type Group = { id: string; instances: Instance[] };
 export type Scenario = "healthy" | "lag" | "unavailable";
 export const centers: DataCenter[] = ["A", "B", "C"];
 export const lagLimit = 1000;
@@ -15,7 +15,6 @@ export const lagLimit = 1000;
 export function createGroups(scenario: Scenario = "healthy"): Group[] {
   return Array.from({ length: 12 }, (_, index) => ({
     id: `G${String(index + 1).padStart(2, "0")}`,
-    mode: index % 2 === 0 ? "asynchronous" : "synchronous",
     instances: centers.map((dc, offset) => ({
       id: index * 3 + offset + 1,
       dc,
@@ -49,7 +48,7 @@ export function setReplicaEnabled(
   groups: Group[], groupId: string, instanceId: number, enabled: boolean,
 ): Group[] {
   return groups.map((group) =>
-    group.id === groupId && group.mode === "asynchronous"
+    group.id === groupId
       ? {
           ...group,
           instances: group.instances.map((instance) =>
@@ -62,27 +61,33 @@ export function setReplicaEnabled(
   );
 }
 
-export function bulkMoveBlockers(groups: Group[], source: DataCenter, destination: DataCenter): string[] {
-  if (source === destination) return ["Выберите разные ЦОД источника и назначения"];
+export type BulkDestinations = Partial<Record<string, DataCenter>>;
+
+export function groupsMasteredIn(groups: Group[], source: DataCenter): Group[] {
   return groups.filter((group) =>
     group.instances.some((instance) => instance.dc === source && instance.role === "master"),
-  ).flatMap((group) => {
+  );
+}
+
+export function bulkMoveBlockers(groups: Group[], source: DataCenter, destinations: BulkDestinations): string[] {
+  return groupsMasteredIn(groups, source).flatMap((group) => {
+    const destination = destinations[group.id];
+    if (!destination) return [`${group.id}: выберите целевой ЦОД`];
+    if (source === destination) return [`${group.id}: целевой ЦОД совпадает с исходным`];
     const master = group.instances.find((instance) => instance.role === "master");
     const target = group.instances.find((instance) => instance.dc === destination);
     if (!target) return [`${group.id}: нет экземпляра в ЦОД ${destination}`];
-    if (target.role === "master") return [];
     if (!master?.available) return [`${group.id}: текущий мастер недоступен`];
     const reason = ineligibleReason(target);
     return reason ? [`${group.id}: ${reason.toLowerCase()}`] : [];
   });
 }
 
-export function moveAllMasters(groups: Group[], source: DataCenter, destination: DataCenter): Group[] {
-  if (bulkMoveBlockers(groups, source, destination).length) return groups;
-  return groups.reduce((current, group) => {
-    if (!group.instances.some((instance) => instance.dc === source && instance.role === "master")) return current;
-    const target = group.instances.find((instance) => instance.dc === destination)!;
-    return target.role === "master" ? current : switchMaster(current, group.id, target.id);
+export function moveAllMasters(groups: Group[], source: DataCenter, destinations: BulkDestinations): Group[] {
+  if (bulkMoveBlockers(groups, source, destinations).length) return groups;
+  return groupsMasteredIn(groups, source).reduce((current, group) => {
+    const target = group.instances.find((instance) => instance.dc === destinations[group.id])!;
+    return switchMaster(current, group.id, target.id);
   }, groups);
 }
 
