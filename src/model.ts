@@ -9,6 +9,13 @@ export type Instance = {
 };
 export type Group = { id: string; instances: Instance[] };
 export type Scenario = "healthy" | "lag" | "unavailable";
+export type ServiceMode = "mono" | "multi";
+export const shardEgressPodCount = 372;
+export const shardEgressNamespaceCount = 3;
+export const serviceModes = {
+  mono: { label: "Моно", emoji: "🎯" },
+  multi: { label: "Мульти", emoji: "🌐" },
+};
 export const centers: DataCenter[] = ["A", "B", "C"];
 export const lagLimit = 1000;
 

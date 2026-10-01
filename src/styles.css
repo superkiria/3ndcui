@@ -1,5 +1,5 @@
 :root {
-  font-family: var(--mono);
+  font-family: var(--sans);
   color: #202e40;
   background: #d5e9d9;
   font-synthesis: none;
@@ -8,6 +8,7 @@
   font-size: calc(14px + 4pt);
   font-weight: 400;
   --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
   --dc-a-accent: #a33b16;
   --dc-a-tint: #f6ece7;
   --dc-a-ink: #713018;
@@ -76,6 +77,91 @@ h2 {
 h3 {
   font-size: 15px;
   font-weight: 650;
+}
+h1,
+h2,
+h3,
+h4,
+table,
+code,
+.role,
+.availability,
+.lag,
+.replication-disabled,
+.dc-label,
+.status-badge,
+.healthy-status,
+.mode-value,
+.bulk-controls label,
+.bulk-controls select,
+.target-option,
+.eyebrow {
+  font-family: var(--mono);
+}
+.prose,
+.history-empty p,
+.bulk-controls .prose,
+.target-option .prose {
+  font-family: var(--sans);
+}
+.mode-section {
+  padding: 20px;
+  margin-bottom: 18px;
+  background: #fff;
+  border: 1px solid #c7d1de;
+  border-radius: 4px;
+}
+.mode-value {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0 16px;
+  font-size: 26px;
+}
+.mode-section .simulation-note {
+  margin-bottom: 0;
+}
+.mode-progress {
+  border-top: 1px solid #e2e7ec;
+  margin-top: 18px;
+  padding-top: 16px;
+}
+.mode-progress .stages {
+  max-width: 620px;
+}
+.mode-pod-summary {
+  color: #526176;
+  line-height: 1.5;
+}
+.mode-pod-counts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0 18px;
+  max-width: 620px;
+}
+.mode-pod-counts > div {
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid #d3dce7;
+  border-radius: 4px;
+}
+.mode-pod-counts dt,
+.mode-pod-counts dd {
+  font-family: var(--mono);
+}
+.mode-pod-counts dd {
+  margin: 6px 0 0;
+  font-size: 26px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.mode-pod-progress {
+  display: block;
+  width: 100%;
+  max-width: 620px;
+  height: 12px;
+  margin-top: 12px;
 }
 .app-shell {
   max-width: 1600px;

@@ -10,8 +10,11 @@ import {
   matchesSearch,
   setReplicaEnabled,
   switchMaster,
+  serviceModes,
+  shardEgressPodCount,
+  shardEgressNamespaceCount,
 } from "./model";
-import type { BulkDestinations, DataCenter, Group, Instance, Scenario } from "./model";
+import type { BulkDestinations, DataCenter, Group, Instance, Scenario, ServiceMode } from "./model";
 import "./styles.css";
 
 type Operation = {
@@ -26,7 +29,7 @@ type Operation = {
   reason?: string;
 };
 type SimpleEvent = {
-  kind: "bulk" | "replica";
+  kind: "bulk" | "replica" | "mode";
   id: number;
   time: string;
   group: string;
@@ -37,6 +40,8 @@ type SimpleEvent = {
 type HistoryEntry = Operation | SimpleEvent;
 type BulkProgress = { id: number; source: DataCenter; destinations: BulkDestinations; groupIds: string[]; completed: number; stage: "check" | "moving" | "done"; step: number };
 type ReplicaProgress = { id: number; group: string; instanceId: number; instanceDc: DataCenter; enabled: boolean; stage: number; status: "running" | "success" };
+type ModeProgress = { target: ServiceMode; stage: number; switchedPods: number; status: "running" | "success" };
+const modeStages = ["Публикация флага в ZooKeeper", "Ожидание подов shard-egress", "Завершение перехода"];
 const statuses = {
   running: "Выполняется",
   success: "Успешно",
@@ -51,7 +56,7 @@ const stages = [
 ];
 const replicaStages = ["Предварительная проверка", "Публикация карты распределения", "Проверка после изменения"];
 const instanceNumber = (id: number) => String(id).padStart(2, "0");
-const randomStepDuration = () => 3000 + Math.floor(Math.random() * 4001);
+const randomStepDuration = () => Math.floor(Math.random() * 5001);
 function stageOffsets(count: number): number[] {
   const offsets = [0];
   for (let step = 0; step < count; step++) {
@@ -184,7 +189,7 @@ function StageList({ labels, step, status = "running" }: { labels: string[]; ste
         <span className="stage-marker">
           {completed ? <Icon name="check" size={14} /> : failed ? "!" : current ? <span className="spinner" /> : index + 1}
         </span>
-        <span>{label}</span>
+        <span className={label.split(/\s+/).length >= 4 ? "prose" : undefined}>{label}</span>
         <small>{completed ? "Готово" : failed ? "Ошибка" : current ? "Выполняется" : status === "error" ? "Не выполнено" : "Ожидание"}</small>
       </li>;
     })}
@@ -202,6 +207,8 @@ function App() {
   const [source, setSource] = useState<DataCenter | "">("");
   const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
   const [replicaProgress, setReplicaProgress] = useState<ReplicaProgress | null>(null);
+  const [mode, setMode] = useState<ServiceMode>("mono");
+  const [modeProgress, setModeProgress] = useState<ModeProgress | null>(null);
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [choosing, setChoosing] = useState(false);
   const [targetId, setTargetId] = useState<number | null>(null);
@@ -211,7 +218,7 @@ function App() {
   const locked = useRef(false);
   const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
   const sequence = useRef(0);
-  const busy = operation?.status === "running" || (bulkProgress !== null && bulkProgress.stage !== "done") || replicaProgress?.status === "running";
+  const busy = operation?.status === "running" || (bulkProgress !== null && bulkProgress.stage !== "done") || replicaProgress?.status === "running" || modeProgress?.status === "running";
   const group = groups.find((item) => item.id === selectedGroup);
   const master = group?.instances.find(
     (instance) => instance.role === "master",
@@ -230,6 +237,9 @@ function App() {
   const bulkBlockers = source ? bulkMoveBlockers(groups, source, destinations) : [];
   const groupsToMove = source ? groupsMasteredIn(groups, source) : [];
   const selectedDestinations = groupsToMove.filter((item) => destinations[item.id]).length;
+  const transitioningPods = modeProgress && modeProgress.target !== mode ? modeProgress.switchedPods : 0;
+  const monoPods = mode === "mono" ? shardEgressPodCount - transitioningPods : transitioningPods;
+  const multiPods = shardEgressPodCount - monoPods;
 
   useEffect(() => {
     if (selectedGroup && !dialog.current?.open) dialog.current?.showModal();
@@ -256,6 +266,8 @@ function App() {
     setBulkProgress(null);
     setDestinations({});
     setReplicaProgress(null);
+    setMode("mono");
+    setModeProgress(null);
     closePanel();
     if (reset) {
       setSearch("");
@@ -274,6 +286,49 @@ function App() {
     setHistory((items) =>
       items.map((item) => (item.id === next.id ? next : item)),
     );
+  }
+  function switchMode() {
+    if (locked.current) return;
+    locked.current = true;
+    const nextMode: ServiceMode = mode === "mono" ? "multi" : "mono";
+    const started: ModeProgress = { target: nextMode, stage: 0, switchedPods: 0, status: "running" };
+    const event: SimpleEvent = {
+      kind: "mode", id: ++sequence.current, time: new Date().toLocaleTimeString("ru-RU"),
+      group: "Режим сервиса", description: `${serviceModes[mode].label} → ${serviceModes[nextMode].label}`,
+      status: "running", stage: 0,
+    };
+    setModeProgress(started);
+    setHistory((items) => [event, ...items]);
+    setNotice(`Начата симуляция перехода в режим «${serviceModes[nextMode].label}».`);
+    function updateProgress(switchedPods: number, stage: number, done = false) {
+      setModeProgress({ ...started, stage, switchedPods, status: done ? "success" : "running" });
+      setHistory((items) => items.map((item) => item.id === event.id ? {
+        ...event, stage, status: done ? "success" : "running",
+        description: `${event.description} · поды: ${switchedPods} из ${shardEgressPodCount}`,
+      } : item));
+      if (done) {
+        setMode(nextMode);
+        locked.current = false;
+        setNotice(`Переход завершён. Текущий режим: ${serviceModes[nextMode].label}.`);
+      }
+    }
+    // Switch one simulated pod every 15 ms, independent of shard data centers.
+    function switchNextPod(switchedPods: number) {
+      timers.current = [setTimeout(() => {
+        const nextCount = switchedPods + 1;
+        const allSwitched = nextCount === shardEgressPodCount;
+        updateProgress(nextCount, allSwitched ? 2 : 1);
+        if (allSwitched) {
+          timers.current = [setTimeout(() => updateProgress(nextCount, modeStages.length, true), randomStepDuration())];
+        } else {
+          switchNextPod(nextCount);
+        }
+      }, 15)];
+    }
+    timers.current = [setTimeout(() => {
+      updateProgress(0, 1);
+      switchNextPod(0);
+    }, randomStepDuration())];
   }
   function toggleReplica(instance: Instance) {
     if (locked.current || !group || instance.role !== "replica") return;
@@ -479,6 +534,30 @@ function App() {
         </div>
       </section>
       <hr className="demo-divider" />
+      <section className="mode-section" aria-labelledby="mode-title">
+        <h2 id="mode-title">Текущий режим</h2>
+        <div className="mode-value" role="status">
+          <span aria-hidden="true">{serviceModes[mode].emoji}</span>
+          <strong>{serviceModes[mode].label}</strong>
+        </div>
+        <p className="mode-pod-summary">shard-egress: {shardEgressPodCount} пода · {shardEgressNamespaceCount} пространства имён</p>
+        <dl className="mode-pod-counts" aria-label="Режимы подов shard-egress" aria-live="polite">
+          <div><dt>🎯 Моно</dt><dd>{monoPods}</dd></div>
+          <div><dt>🌐 Мульти</dt><dd>{multiPods}</dd></div>
+        </dl>
+        <button className="button primary" disabled={busy} onClick={switchMode}>
+          {modeProgress?.status === "running" ? "Переключение…" : `Переключить на ${serviceModes[mode === "mono" ? "multi" : "mono"].label}`}
+        </button>
+        <p className="simulation-note">Симуляция: флаг ZooKeeper и поды shard-egress существуют только в этом демо.</p>
+        {modeProgress && <div className="mode-progress" aria-live="polite">
+          <p>Переход в режим «{serviceModes[modeProgress.target].label}»</p>
+          <StageList labels={modeStages} step={modeProgress.stage} status={modeProgress.status} />
+          <p className="mode-flag">Флаг режима в ZooKeeper: {modeProgress.stage === 0 ? "публикуется" : serviceModes[modeProgress.target].label}</p>
+          <p>Переключились поды: {modeProgress.switchedPods} из {shardEgressPodCount}</p>
+          <progress className="mode-pod-progress" aria-label="Прогресс переключения подов shard-egress" value={modeProgress.switchedPods} max={shardEgressPodCount} />
+          {modeProgress.status === "success" && <p className="success-box">Все поды shard-egress переключились. Переход завершён.</p>}
+        </div>}
+      </section>
       <header className="page-header">
         <div>
           <div className="title-line">
@@ -493,7 +572,7 @@ function App() {
 
       <section className="bulk-section" aria-labelledby="bulk-title">
         <div>
-          <h2 id="bulk-title">Переместить мастера между ЦОД</h2>
+          <h2 id="bulk-title" className="prose">Переместить мастера между ЦОД</h2>
           <p>Выберите исходный ЦОД, затем целевой ЦОД для каждого мастера. Перед началом проверяются все затронутые группы.</p>
         </div>
         <div className="bulk-controls">
@@ -505,23 +584,24 @@ function App() {
           </select>
         </div>
         {!bulkProgress && groupsToMove.length > 0 && <div className="bulk-plan">
-          <h3>2. Куда переместить каждого мастера</h3>
+          <h3 className="prose">2. Куда переместить каждого мастера</h3>
           <div className="bulk-routes">
             {groupsToMove.map((item) => {
               const currentMaster = item.instances.find((instance) => instance.role === "master")!;
+              const selectedReplica = item.instances.find((instance) => instance.dc === destinations[item.id]);
               const blockers = source ? bulkMoveBlockers([item], source, destinations) : [];
               return <div className="bulk-route" key={item.id}>
                 <div><strong>{item.id}</strong><p>Мастер №{instanceNumber(currentMaster.id)} · ЦОД {source}</p></div>
                 <div className="bulk-controls">
-                  <label htmlFor={`bulk-destination-${item.id}`}>В ЦОД для {item.id}</label>
-                  <select id={`bulk-destination-${item.id}`} className={destinations[item.id] ? `dc-color dc-${destinations[item.id]}` : undefined} value={destinations[item.id] ?? ""} disabled={busy}
+                  <label className="prose" htmlFor={`bulk-destination-${item.id}`}>В ЦОД для {item.id}</label>
+                  <select id={`bulk-destination-${item.id}`} className={destinations[item.id] ? `dc-color dc-${destinations[item.id]}${selectedReplica && ineligibleReason(selectedReplica) ? " prose" : ""}` : undefined} value={destinations[item.id] ?? ""} disabled={busy}
                     onChange={(event) => {
                       const dc = event.target.value as DataCenter | "";
                       setDestinations((current) => ({ ...current, [item.id]: dc || undefined }));
                     }}>
                     <option value="">Выберите целевой ЦОД</option>
                     {item.instances.filter((instance) => instance.dc !== source).map((instance) =>
-                      <option className={`dc-color dc-${instance.dc}`} key={instance.dc} value={instance.dc}>ЦОД {instance.dc} · №{instanceNumber(instance.id)}{ineligibleReason(instance) ? ` — ${ineligibleReason(instance)}` : ""}</option>,
+                      <option className={`dc-color dc-${instance.dc}${ineligibleReason(instance) ? " prose" : ""}`} key={instance.dc} value={instance.dc}>ЦОД {instance.dc} · №{instanceNumber(instance.id)}{ineligibleReason(instance) ? ` — ${ineligibleReason(instance)}` : ""}</option>,
                     )}
                   </select>
                 </div>
@@ -754,8 +834,8 @@ function App() {
                             <Icon name="arrow" size={16} />
                             <span>№{instanceNumber(item.target.id)} · ЦОД {item.target.dc}</span>
                           </div>
-                        ) : <span>{item.description}{item.kind === "replica" && item.status === "running" && item.stage !== undefined
-                          ? ` · ${replicaStages[item.stage]}` : ""}</span>}
+                        ) : <span className="prose">{item.description}{(item.kind === "replica" || item.kind === "mode") && item.status === "running" && item.stage !== undefined
+                          ? ` · ${(item.kind === "mode" ? modeStages : replicaStages)[item.stage]}` : ""}</span>}
                       </td>
                       <td>
                         <span className={`status-badge ${item.status}`}>
@@ -882,7 +962,7 @@ function App() {
                   </p>}
                   {shownReplicaOperation.status === "running" ? <p className="muted">
                     Повторное изменение недоступно до завершения. Панель можно закрыть — операция продолжится.
-                  </p> : <button className="button primary full-width" disabled={!master.available}
+                  </p> : <button className="button primary full-width" disabled={busy || !master.available}
                     onClick={() => { setReplicaProgress(null); setChoosing(true); setTargetId(null); }}>
                     Переключить мастер
                   </button>}
@@ -954,7 +1034,7 @@ function App() {
                                 <strong>
                                   №{instanceNumber(instance.id)} · ЦОД {instance.dc}
                                 </strong>
-                                <small className={reason ? "inline-error" : ""}>
+                                <small className={reason ? "inline-error prose" : "prose"}>
                                   {reason ||
                                     `Доступен · отставание ${instance.lag} мс`}
                                 </small>
