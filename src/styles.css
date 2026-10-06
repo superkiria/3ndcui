@@ -238,6 +238,16 @@ code,
 .primary:hover:not(:disabled) {
   background: #1b4679;
 }
+.danger {
+  background: #a52a2a;
+  color: #fff;
+}
+.danger:hover:not(:disabled) {
+  background: #852222;
+}
+.emergency-action {
+  margin-top: 12px;
+}
 .reset-button {
   white-space: nowrap;
 }
@@ -620,6 +630,19 @@ thead th:last-child {
   background: #fff;
   color: #526176;
   border: 1px solid #aab5c2;
+}
+.replica-offline {
+  background: #e5e7eb;
+}
+.master-offline {
+  background: #e5e7eb;
+  color: #526176;
+  border-color: #aab5c2;
+}
+.recovery {
+  background: #fef3c7;
+  color: #78350f;
+  border: 1px solid #d5a326;
 }
 .instance-meta {
   display: flex;

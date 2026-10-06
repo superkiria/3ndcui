@@ -3,9 +3,12 @@ import { createRoot } from "react-dom/client";
 import {
   centers,
   createGroups,
+  startRecovery,
+  completeRecovery,
   bulkMoveBlockers,
   groupsMasteredIn,
   ineligibleReason,
+  instanceStatus,
   isProblematic,
   matchesSearch,
   setReplicaEnabled,
@@ -14,11 +17,12 @@ import {
   shardEgressPodCount,
   shardEgressNamespaceCount,
 } from "./model";
-import type { BulkDestinations, DataCenter, Group, Instance, Scenario, ServiceMode } from "./model";
+import type { BulkDestinations, DataCenter, Group, Instance, MasterTransfer, Scenario, ServiceMode, SwitchoverMode } from "./model";
 import "./styles.css";
 
 type Operation = {
   kind: "switchover";
+  mode: SwitchoverMode;
   id: number;
   time: string;
   group: string;
@@ -29,7 +33,7 @@ type Operation = {
   reason?: string;
 };
 type SimpleEvent = {
-  kind: "bulk" | "replica" | "mode";
+  kind: "bulk" | "replica" | "mode" | "recovery";
   id: number;
   time: string;
   group: string;
@@ -40,6 +44,7 @@ type SimpleEvent = {
 type HistoryEntry = Operation | SimpleEvent;
 type BulkProgress = { id: number; source: DataCenter; destinations: BulkDestinations; groupIds: string[]; completed: number; stage: "check" | "moving" | "done"; step: number };
 type ReplicaProgress = { id: number; group: string; instanceId: number; instanceDc: DataCenter; enabled: boolean; stage: number; status: "running" | "success" };
+type RecoveryProgress = Omit<ReplicaProgress, "enabled">;
 type ModeProgress = { target: ServiceMode; stage: number; switchedPods: number; status: "running" | "success" };
 const modeStages = ["Публикация флага в ZooKeeper", "Ожидание подов shard-egress", "Завершение перехода"];
 const statuses = {
@@ -54,7 +59,9 @@ const stages = [
   "Включение нового мастера",
   "Завершение",
 ];
+const emergencyStages = ["Проверка целевой реплики", "Принудительное отключение старого мастера", "Включение нового мастера", "Завершение"];
 const replicaStages = ["Предварительная проверка", "Публикация карты распределения", "Проверка после изменения"];
+const recoveryStages = ["1", "2", "3"];
 const instanceNumber = (id: number) => String(id).padStart(2, "0");
 const randomStepDuration = () => Math.floor(Math.random() * 5001);
 function stageOffsets(count: number): number[] {
@@ -127,20 +134,21 @@ function Availability({ available }: { available: boolean }) {
   );
 }
 
-function InstanceInfo({ instance }: { instance: Instance }) {
+function InstanceInfo({ instance, transfer }: { instance: Instance; transfer: MasterTransfer | null }) {
+  const status = instanceStatus(instance, transfer);
   return (
     <div
       className={`instance ${!instance.available ? "instance-offline" : ""}`}
     >
       <div className="instance-top">
         <span className="instance-id">№{instanceNumber(instance.id)}</span>
-        <span className={`role ${instance.role}`}>
-          {instance.role === "master" ? "Мастер" : "Реплика"}
+        <span className={`role ${status === "RECOVERY" ? "recovery" : status === "MASTER_OFFLINE" ? "master master-offline" : status === "REPLICA_OFFLINE" ? "replica replica-offline" : status === "REPLICA_A" ? "replica" : "master"}`}>
+          {status}
         </span>
       </div>
       <div className="instance-meta">
         <Availability available={instance.available} />
-        {instance.role === "replica" && instance.available && (
+        {(status === "REPLICA_A" || status === "REPLICA_OFFLINE") && instance.available && (
           instance.replicationEnabled ? (
             <span className={instance.lag > 1000 ? "lag lag-warning" : "lag"}>
               <span>Отставание: </span>{instance.lag} мс
@@ -207,10 +215,12 @@ function App() {
   const [source, setSource] = useState<DataCenter | "">("");
   const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
   const [replicaProgress, setReplicaProgress] = useState<ReplicaProgress | null>(null);
+  const [recoveryProgress, setRecoveryProgress] = useState<RecoveryProgress | null>(null);
   const [mode, setMode] = useState<ServiceMode>("mono");
   const [modeProgress, setModeProgress] = useState<ModeProgress | null>(null);
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [choosing, setChoosing] = useState(false);
+  const [switchoverMode, setSwitchoverMode] = useState<SwitchoverMode>("planned");
   const [targetId, setTargetId] = useState<number | null>(null);
   const [operation, setOperation] = useState<Operation | null>(null);
   const [notice, setNotice] = useState("");
@@ -218,7 +228,7 @@ function App() {
   const locked = useRef(false);
   const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
   const sequence = useRef(0);
-  const busy = operation?.status === "running" || (bulkProgress !== null && bulkProgress.stage !== "done") || replicaProgress?.status === "running" || modeProgress?.status === "running";
+  const busy = operation?.status === "running" || (bulkProgress !== null && bulkProgress.stage !== "done") || replicaProgress?.status === "running" || recoveryProgress?.status === "running" || modeProgress?.status === "running";
   const group = groups.find((item) => item.id === selectedGroup);
   const master = group?.instances.find(
     (instance) => instance.role === "master",
@@ -226,6 +236,7 @@ function App() {
   const target = group?.instances.find((instance) => instance.id === targetId);
   const shownOperation = operation?.group === selectedGroup ? operation : null;
   const shownReplicaOperation = replicaProgress?.group === selectedGroup ? replicaProgress : null;
+  const shownRecoveryOperation = recoveryProgress?.group === selectedGroup ? recoveryProgress : null;
   const visibleGroups = groups.filter(
     (item) =>
       matchesSearch(item, search) && (!onlyProblems || isProblematic(item)),
@@ -240,6 +251,17 @@ function App() {
   const transitioningPods = modeProgress && modeProgress.target !== mode ? modeProgress.switchedPods : 0;
   const monoPods = mode === "mono" ? shardEgressPodCount - transitioningPods : transitioningPods;
   const multiPods = shardEgressPodCount - monoPods;
+  let activeTransfer: MasterTransfer | null = null;
+  if (operation?.status === "running" && operation.stage > 0) {
+    activeTransfer = { sourceId: operation.source.id, targetId: operation.target.id, emergency: operation.mode === "emergency" };
+  } else if (bulkProgress?.stage === "moving" && bulkProgress.step > 0) {
+    const movingGroup = groups.find((item) => item.id === bulkProgress.groupIds[bulkProgress.completed]);
+    const sourceInstance = movingGroup?.instances.find((item) => item.role === "master");
+    const targetInstance = movingGroup?.instances.find((item) => item.dc === bulkProgress.destinations[movingGroup.id]);
+    if (sourceInstance && targetInstance) {
+      activeTransfer = { sourceId: sourceInstance.id, targetId: targetInstance.id };
+    }
+  }
 
   useEffect(() => {
     if (selectedGroup && !dialog.current?.open) dialog.current?.showModal();
@@ -250,11 +272,20 @@ function App() {
   function openGroup(id: string) {
     setSelectedGroup(id);
     setChoosing(false);
+    setSwitchoverMode("planned");
     setTargetId(null);
   }
   function closePanel() {
     setSelectedGroup(null);
     setChoosing(false);
+    setTargetId(null);
+  }
+  function chooseMaster(mode: SwitchoverMode = "planned") {
+    setSwitchoverMode(mode);
+    setOperation(null);
+    setReplicaProgress(null);
+    setRecoveryProgress(null);
+    setChoosing(true);
     setTargetId(null);
   }
   function loadScenario(next: Scenario, reset = false) {
@@ -266,6 +297,7 @@ function App() {
     setBulkProgress(null);
     setDestinations({});
     setReplicaProgress(null);
+    setRecoveryProgress(null);
     setMode("mono");
     setModeProgress(null);
     closePanel();
@@ -336,6 +368,7 @@ function App() {
     const enabled = !instance.replicationEnabled;
     const started: ReplicaProgress = { id: ++sequence.current, group: group.id, instanceId: instance.id, instanceDc: instance.dc, enabled, stage: 0, status: "running" };
     setOperation(null);
+    setRecoveryProgress(null);
     setChoosing(false);
     setTargetId(null);
     setReplicaProgress(started);
@@ -366,6 +399,43 @@ function App() {
         setNotice(`${group.id}: репликация №${instanceNumber(instance.id)} ${enabled ? "включена" : "отключена"}.`);
       }, offsets[3]),
     ];
+  }
+  function recoverMaster(instance: Instance) {
+    if (locked.current || !group || instance.role !== "offline-master") return;
+    locked.current = true;
+    const started: RecoveryProgress = {
+      id: ++sequence.current, group: group.id, instanceId: instance.id, instanceDc: instance.dc,
+      stage: 0, status: "running",
+    };
+    setOperation(null);
+    setReplicaProgress(null);
+    setChoosing(false);
+    setTargetId(null);
+    setRecoveryProgress(started);
+    setGroups((items) => startRecovery(items, started.group, started.instanceId));
+    const event: SimpleEvent = {
+      kind: "recovery", id: started.id, time: new Date().toLocaleTimeString("ru-RU"), group: started.group,
+      description: `Восстановление №${instanceNumber(instance.id)} в ЦОД ${instance.dc}`,
+      status: "running", stage: 0,
+    };
+    setHistory((items) => [event, ...items]);
+    setNotice(`${started.group}: начата симуляция восстановления №${instanceNumber(instance.id)}.`);
+    const offsets = stageOffsets(recoveryStages.length);
+    timers.current = offsets.slice(1).map((offset, index) => setTimeout(() => {
+      const stage = index + 1;
+      const done = stage === recoveryStages.length;
+      const status = done ? "success" : "running";
+      setRecoveryProgress({ ...started, stage, status });
+      setHistory((items) => items.map((item) => item.id === started.id ? {
+        ...event, stage, status,
+        description: done ? `${event.description}: REPLICA_A` : event.description,
+      } : item));
+      if (done) {
+        setGroups((items) => completeRecovery(items, started.group, started.instanceId));
+        locked.current = false;
+        setNotice(`${started.group}: №${instanceNumber(instance.id)} восстановлен, статус REPLICA_A.`);
+      }
+    }, offset));
   }
   function moveAll() {
     if (locked.current || !source || bulkBlockers.length || !groupsToMove.length) return;
@@ -417,10 +487,11 @@ function App() {
     if (
       locked.current ||
       !group ||
-      !master?.available ||
+      !master ||
+      (switchoverMode === "planned" && !master.available) ||
       !target ||
       target.role !== "replica" ||
-      ineligibleReason(target)
+      ineligibleReason(target, switchoverMode)
     )
       return;
     locked.current = true;
@@ -428,8 +499,10 @@ function App() {
     setFailNext(false);
     setChoosing(false);
     setReplicaProgress(null);
+    setRecoveryProgress(null);
     const started: Operation = {
       kind: "switchover",
+      mode: switchoverMode,
       id: ++sequence.current,
       time: new Date().toLocaleTimeString("ru-RU"),
       group: group.id,
@@ -440,8 +513,9 @@ function App() {
     };
     setOperation(started);
     setHistory((items) => [started, ...items]);
-    setNotice(`Начата симуляция переключения ${group.id}.`);
-    const offsets = stageOffsets(stages.length);
+    setNotice(`Начата симуляция ${switchoverMode === "emergency" ? "экстренного" : "планового"} переключения ${group.id}.`);
+    const operationStages = switchoverMode === "emergency" ? emergencyStages : stages;
+    const offsets = stageOffsets(operationStages.length);
     timers.current = [];
     if (shouldFail) {
       timers.current.push(
@@ -466,15 +540,15 @@ function App() {
     timers.current.push(
       setTimeout(() => {
         setGroups((items) =>
-          switchMaster(items, started.group, started.target.id),
+          switchMaster(items, started.group, started.target.id, started.mode),
         );
-        updateOperation({ ...started, stage: stages.length, status: "success" });
+        updateOperation({ ...started, stage: operationStages.length, status: "success" });
         locked.current = false;
         setTargetId(null);
         setNotice(
           `${started.group}: мастер переключён на №${instanceNumber(started.target.id)} в ЦОД ${started.target.dc}.`,
         );
-      }, offsets[stages.length]),
+      }, offsets[operationStages.length]),
     );
   }
 
@@ -758,7 +832,7 @@ function App() {
                           !instance.available ? "unavailable-cell" : undefined
                         }
                       >
-                        <InstanceInfo instance={instance} />
+                        <InstanceInfo instance={instance} transfer={activeTransfer} />
                       </td>
                     ))}
                     <td>
@@ -830,12 +904,13 @@ function App() {
                       <td>
                         {item.kind === "switchover" ? (
                           <div className="history-route">
+                            {item.mode === "emergency" && <span className="prose">Экстренно:</span>}
                             <span>№{instanceNumber(item.source.id)} · ЦОД {item.source.dc}</span>
                             <Icon name="arrow" size={16} />
                             <span>№{instanceNumber(item.target.id)} · ЦОД {item.target.dc}</span>
                           </div>
-                        ) : <span className="prose">{item.description}{(item.kind === "replica" || item.kind === "mode") && item.status === "running" && item.stage !== undefined
-                          ? ` · ${(item.kind === "mode" ? modeStages : replicaStages)[item.stage]}` : ""}</span>}
+                        ) : <span className="prose">{item.description}{(item.kind === "replica" || item.kind === "mode" || item.kind === "recovery") && item.status === "running" && item.stage !== undefined
+                          ? ` · ${item.kind === "recovery" ? "Шаг " : ""}${(item.kind === "mode" ? modeStages : item.kind === "recovery" ? recoveryStages : replicaStages)[item.stage]}` : ""}</span>}
                       </td>
                       <td>
                         <span className={`status-badge ${item.status}`}>
@@ -935,12 +1010,18 @@ function App() {
                       key={instance.id}
                     >
                       <span className="dc-label">ЦОД {instance.dc}</span>
-                      <InstanceInfo instance={instance} />
+                      <InstanceInfo instance={instance} transfer={activeTransfer} />
                       {instance.role === "replica" && (
                         <button className="button primary replica-button"
                           disabled={busy}
                           onClick={() => toggleReplica(instance)}>
                           {instance.replicationEnabled ? "Отключить репликацию" : "Включить репликацию"}
+                        </button>
+                      )}
+                      {(instance.role === "offline-master" || instance.role === "recovery") && (
+                        <button className="button primary replica-button" disabled={busy}
+                          onClick={() => recoverMaster(instance)}>
+                          {instance.role === "recovery" ? "Восстановление…" : "Восстановить"}
                         </button>
                       )}
                     </div>
@@ -950,6 +1031,17 @@ function App() {
               </section>
               </div>
               <div className="panel-actions">
+                {!choosing && shownRecoveryOperation && <section className="operation-section recovery-operation" aria-live="polite">
+                  <h3>{shownRecoveryOperation.status === "running" ? "Восстановление экземпляра" : "Экземпляр восстановлен"}</h3>
+                  <p className="simulation-note">Симуляция операции · {shownRecoveryOperation.group}</p>
+                  <p className="operation-route">№{instanceNumber(shownRecoveryOperation.instanceId)} · ЦОД {shownRecoveryOperation.instanceDc}</p>
+                  <StageList labels={recoveryStages} step={shownRecoveryOperation.stage} status={shownRecoveryOperation.status} />
+                  {shownRecoveryOperation.status === "success" ? <>
+                    <p className="success-box">Статус REPLICA_A. Экземпляр доступен, репликация включена.</p>
+                    <button className="button primary full-width" disabled={busy || !master.available}
+                      onClick={() => chooseMaster()}>Переключить мастер</button>
+                  </> : <p className="muted">Панель можно закрыть — восстановление продолжится.</p>}
+                </section>}
                 {!choosing && shownReplicaOperation && <section className="operation-section replica-operation" aria-live="polite">
                   <h3>{shownReplicaOperation.status === "running"
                     ? `${shownReplicaOperation.enabled ? "Включение" : "Отключение"} репликации`
@@ -963,11 +1055,11 @@ function App() {
                   {shownReplicaOperation.status === "running" ? <p className="muted">
                     Повторное изменение недоступно до завершения. Панель можно закрыть — операция продолжится.
                   </p> : <button className="button primary full-width" disabled={busy || !master.available}
-                    onClick={() => { setReplicaProgress(null); setChoosing(true); setTargetId(null); }}>
+                    onClick={() => chooseMaster()}>
                     Переключить мастер
                   </button>}
                 </section>}
-              {!choosing && !shownOperation && !shownReplicaOperation && (
+              {!choosing && !shownOperation && !shownReplicaOperation && !shownRecoveryOperation && (
                 <div className="action-section">
                   <h3>Плановое переключение</h3>
                   <p>
@@ -977,11 +1069,7 @@ function App() {
                   <button
                     className="button primary full-width"
                     disabled={busy || !master.available}
-                    onClick={() => {
-                      setReplicaProgress(null);
-                      setChoosing(true);
-                      setTargetId(null);
-                    }}
+                    onClick={() => chooseMaster()}
                   >
                     Переключить мастер <Icon name="arrow" size={17} />
                   </button>
@@ -1009,14 +1097,16 @@ function App() {
                       <span className="step-number">2</span>Выбор нового мастера
                     </h3>
                     <p className="muted">
-                      Выберите реплику, которая станет новым мастером.
+                      {switchoverMode === "emergency"
+                        ? "Экстренное переключение: ожидание Kafka-репликации пропускается. Прежний мастер получит MASTER_OFFLINE и останется отключённым. Данные с отставшей реплики могут быть неполными."
+                        : "Выберите реплику, которая станет новым мастером."}
                     </p>
                     <fieldset className="target-options">
                       <legend className="sr-only">Новый мастер</legend>
                       {group.instances
                         .filter((instance) => instance.role === "replica")
                         .map((instance) => {
-                          const reason = ineligibleReason(instance);
+                          const reason = ineligibleReason(instance, switchoverMode);
                           return (
                             <label
                               key={instance.id}
@@ -1053,7 +1143,7 @@ function App() {
                     </h3>
                     <p
                       className={
-                        master.available ? "check-pass" : "inline-error"
+                        master.available ? "check-pass" : switchoverMode === "emergency" ? "muted" : "inline-error"
                       }
                     >
                       <span aria-hidden="true">
@@ -1061,7 +1151,7 @@ function App() {
                       </span>
                       {master.available
                         ? "Текущий мастер доступен"
-                        : "Текущий мастер недоступен"}
+                        : switchoverMode === "emergency" ? "Текущий мастер недоступен — экстренное переключение разрешено" : "Текущий мастер недоступен"}
                     </p>
                     <p className={target ? "check-pass" : "muted"}>
                       <span aria-hidden="true">{target ? "✓" : "○"}</span>
@@ -1071,7 +1161,9 @@ function App() {
                     </p>
                     <p className={target ? "check-pass" : "muted"}>
                       <span aria-hidden="true">{target ? "✓" : "○"}</span>
-                      {target
+                      {switchoverMode === "emergency"
+                        ? "Ожидание Kafka-репликации и проверка отставания пропускаются"
+                        : target
                         ? `Отставание ${target.lag} мс — не более 1000 мс`
                         : "Отставание будет проверено после выбора"}
                     </p>
@@ -1096,11 +1188,11 @@ function App() {
                       Это симуляция. Реальные базы данных не затрагиваются.
                     </p>
                     <button
-                      className="button primary full-width"
-                      disabled={!target || !master.available || busy}
+                      className={`button ${switchoverMode === "emergency" ? "danger" : "primary"} full-width`}
+                      disabled={!target || Boolean(target && ineligibleReason(target, switchoverMode)) || (switchoverMode === "planned" && !master.available) || busy}
                       onClick={startOperation}
                     >
-                      Подтвердить переключение
+                      {switchoverMode === "emergency" ? "Подтвердить экстренное переключение" : "Подтвердить переключение"}
                     </button>
                     {!target && (
                       <p className="control-hint">
@@ -1130,14 +1222,14 @@ function App() {
                         : "Переключение не выполнено"}
                   </h3>
                   <p className="simulation-note">
-                    Симуляция операции · {shownOperation.group}
+                    Симуляция {shownOperation.mode === "emergency" ? "экстренного" : "планового"} переключения · {shownOperation.group}
                   </p>
                   <p className="operation-route">
                     №{instanceNumber(shownOperation.source.id)} · ЦОД {shownOperation.source.dc}{" "}
                     → №{instanceNumber(shownOperation.target.id)} · ЦОД{" "}
                     {shownOperation.target.dc}
                   </p>
-                  <StageList labels={stages} step={shownOperation.stage} status={shownOperation.status} />
+                  <StageList labels={shownOperation.mode === "emergency" ? emergencyStages : stages} step={shownOperation.stage} status={shownOperation.status} />
                   {shownOperation.status === "error" && (
                     <p className="error-box" role="alert">
                       {shownOperation.reason}
@@ -1146,8 +1238,9 @@ function App() {
                   {shownOperation.status === "success" && (
                     <p className="success-box">
                       Новый мастер — №{instanceNumber(shownOperation.target.id)} в ЦОД{" "}
-                      {shownOperation.target.dc}. Предыдущий мастер стал
-                      репликой.
+                      {shownOperation.target.dc}. {shownOperation.mode === "emergency"
+                        ? "Предыдущий мастер отключён: MASTER_OFFLINE. Репликация на нём отключена."
+                        : "Предыдущий мастер стал репликой."}
                     </p>
                   )}
                   {shownOperation.status === "running" ? (
@@ -1158,12 +1251,8 @@ function App() {
                   ) : (
                     <button
                       className="button primary full-width"
-                      onClick={() => {
-                        setOperation(null);
-                        setChoosing(true);
-                        setTargetId(null);
-                      }}
-                      disabled={busy || !master.available}
+                      onClick={() => chooseMaster(shownOperation.status === "error" ? shownOperation.mode : "planned")}
+                      disabled={busy || (!master.available && !(shownOperation.status === "error" && shownOperation.mode === "emergency"))}
                     >
                       {shownOperation.status === "error"
                         ? "Повторить переключение"
@@ -1172,6 +1261,13 @@ function App() {
                   )}
                 </section>
               )}
+              {!choosing && <div className="emergency-action">
+                <button className="button danger full-width" disabled={busy}
+                  onClick={() => chooseMaster("emergency")}>
+                  Экстренно вывести мастер
+                </button>
+                <p className="simulation-note">Только для одной группы. Без ожидания Kafka-репликации; прежний мастер станет MASTER_OFFLINE.</p>
+              </div>}
               </div>
             </div>
             <footer className="panel-footer">

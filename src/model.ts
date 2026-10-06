@@ -2,12 +2,43 @@ export type DataCenter = "A" | "B" | "C";
 export type Instance = {
   id: number;
   dc: DataCenter;
-  role: "master" | "replica";
+  role: "master" | "replica" | "offline-master" | "recovery";
   available: boolean;
   lag: number;
   replicationEnabled: boolean;
 };
 export type Group = { id: string; instances: Instance[] };
+export type InstanceStatus = "MASTER_RW" | "MASTER_OFFLINE" | "RECOVERY" | "REPLICA_A" | "REPLICA_OFFLINE" | "MASTER_W" | "MASTER_R";
+export type MasterTransfer = { sourceId: number; targetId: number; emergency?: boolean };
+export type SwitchoverMode = "planned" | "emergency";
+
+export function instanceStatus(instance: Instance, transfer: MasterTransfer | null = null): InstanceStatus {
+  if (instance.id === transfer?.sourceId) return transfer.emergency ? "MASTER_OFFLINE" : "MASTER_R";
+  if (instance.id === transfer?.targetId) return "MASTER_W";
+  if (instance.role === "offline-master") return "MASTER_OFFLINE";
+  if (instance.role === "recovery") return "RECOVERY";
+  if (instance.role === "master") return "MASTER_RW";
+  return instance.replicationEnabled ? "REPLICA_A" : "REPLICA_OFFLINE";
+}
+
+export function startRecovery(groups: Group[], groupId: string, instanceId: number): Group[] {
+  return groups.map((group) => group.id === groupId ? {
+    ...group,
+    instances: group.instances.map((instance) => instance.id === instanceId && instance.role === "offline-master"
+      ? { ...instance, role: "recovery", available: false, replicationEnabled: false }
+      : instance),
+  } : group);
+}
+
+export function completeRecovery(groups: Group[], groupId: string, instanceId: number): Group[] {
+  return groups.map((group) => group.id === groupId ? {
+    ...group,
+    instances: group.instances.map((instance) => instance.id === instanceId && instance.role === "recovery"
+      ? { ...instance, role: "replica", available: true, replicationEnabled: true, lag: 0 }
+      : instance),
+  } : group);
+}
+
 export type Scenario = "healthy" | "lag" | "unavailable";
 export type ServiceMode = "mono" | "multi";
 export const shardEgressPodCount = 372;
@@ -43,10 +74,11 @@ export const isProblematic = (group: Group) =>
       (instance.role === "replica" && instance.replicationEnabled && instance.lag > lagLimit),
   );
 
-export function ineligibleReason(instance: Instance): string | null {
+export function ineligibleReason(instance: Instance, mode: SwitchoverMode = "planned"): string | null {
+  if (instance.role !== "replica") return "Экземпляр не является репликой";
   if (!instance.available) return "Экземпляр недоступен";
   if (!instance.replicationEnabled) return "Репликация отключена";
-  if (instance.lag > lagLimit)
+  if (mode === "planned" && instance.lag > lagLimit)
     return `Отставание ${instance.lag} мс превышает 1000 мс`;
   return null;
 }
@@ -112,6 +144,7 @@ export function switchMaster(
   groups: Group[],
   groupId: string,
   targetId: number,
+  mode: SwitchoverMode = "planned",
 ): Group[] {
   return groups.map((group) => {
     if (group.id !== groupId) return group;
@@ -120,10 +153,11 @@ export function switchMaster(
     );
     const target = group.instances.find((instance) => instance.id === targetId);
     if (
-      !master?.available ||
+      !master ||
+      (mode === "planned" && !master.available) ||
       !target ||
       target.role !== "replica" ||
-      ineligibleReason(target)
+      ineligibleReason(target, mode)
     )
       return group;
     return {
@@ -132,7 +166,9 @@ export function switchMaster(
         if (instance.id === targetId)
           return { ...instance, role: "master", lag: 0 };
         if (instance.role === "master")
-          return { ...instance, role: "replica", lag: 32 };
+          return mode === "emergency"
+            ? { ...instance, role: "offline-master", available: false, replicationEnabled: false }
+            : { ...instance, role: "replica", lag: 32 };
         return instance;
       }),
     };
