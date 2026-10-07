@@ -5,8 +5,8 @@ import {
   createGroups,
   startRecovery,
   completeRecovery,
-  bulkMoveBlockers,
-  groupsMasteredIn,
+  distributionBlockers,
+  distributionMoves,
   ineligibleReason,
   instanceStatus,
   isProblematic,
@@ -42,7 +42,7 @@ type SimpleEvent = {
   stage?: number;
 };
 type HistoryEntry = Operation | SimpleEvent;
-type BulkProgress = { id: number; source: DataCenter; destinations: BulkDestinations; groupIds: string[]; completed: number; stage: "check" | "moving" | "done"; step: number };
+type BulkProgress = { id: number; sources: BulkDestinations; destinations: BulkDestinations; groupIds: string[]; completed: number; stage: "check" | "moving" | "done"; step: number };
 type ReplicaProgress = { id: number; group: string; instanceId: number; instanceDc: DataCenter; enabled: boolean; stage: number; status: "running" | "success" };
 type RecoveryProgress = Omit<ReplicaProgress, "enabled">;
 type ModeProgress = { target: ServiceMode; stage: number; switchedPods: number; status: "running" | "success" };
@@ -212,7 +212,7 @@ function App() {
   const [failNext, setFailNext] = useState(false);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [destinations, setDestinations] = useState<BulkDestinations>({});
-  const [source, setSource] = useState<DataCenter | "">("");
+  const [migrationOpen, setMigrationOpen] = useState(false);
   const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null);
   const [replicaProgress, setReplicaProgress] = useState<ReplicaProgress | null>(null);
   const [recoveryProgress, setRecoveryProgress] = useState<RecoveryProgress | null>(null);
@@ -225,6 +225,7 @@ function App() {
   const [operation, setOperation] = useState<Operation | null>(null);
   const [notice, setNotice] = useState("");
   const dialog = useRef<HTMLDialogElement>(null);
+  const migrationDialog = useRef<HTMLDialogElement>(null);
   const locked = useRef(false);
   const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
   const sequence = useRef(0);
@@ -245,9 +246,8 @@ function App() {
   const offlineCount = groups
     .flatMap((item) => item.instances)
     .filter((instance) => !instance.available).length;
-  const bulkBlockers = source ? bulkMoveBlockers(groups, source, destinations) : [];
-  const groupsToMove = source ? groupsMasteredIn(groups, source) : [];
-  const selectedDestinations = groupsToMove.filter((item) => destinations[item.id]).length;
+  const bulkBlockers = distributionBlockers(groups, destinations);
+  const groupsToMove = distributionMoves(groups, destinations);
   const transitioningPods = modeProgress && modeProgress.target !== mode ? modeProgress.switchedPods : 0;
   const monoPods = mode === "mono" ? shardEgressPodCount - transitioningPods : transitioningPods;
   const multiPods = shardEgressPodCount - monoPods;
@@ -267,7 +267,23 @@ function App() {
     if (selectedGroup && !dialog.current?.open) dialog.current?.showModal();
     if (!selectedGroup && dialog.current?.open) dialog.current?.close();
   }, [selectedGroup]);
+  useEffect(() => {
+    if (migrationOpen && !migrationDialog.current?.open) migrationDialog.current?.showModal();
+    if (!migrationOpen && migrationDialog.current?.open) migrationDialog.current?.close();
+  }, [migrationOpen]);
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
+
+  function editDistribution() {
+    if (locked.current) return;
+    setDestinations({});
+    setBulkProgress(null);
+  }
+
+  function selectDestination(groupId: string, dc: DataCenter) {
+    if (locked.current) return;
+    setBulkProgress(null);
+    setDestinations((current) => ({ ...current, [groupId]: dc }));
+  }
 
   function openGroup(id: string) {
     setSelectedGroup(id);
@@ -296,6 +312,7 @@ function App() {
     setOperation(null);
     setBulkProgress(null);
     setDestinations({});
+    setMigrationOpen(false);
     setReplicaProgress(null);
     setRecoveryProgress(null);
     setMode("mono");
@@ -305,7 +322,6 @@ function App() {
       setSearch("");
       setOnlyProblems(false);
       setFailNext(false);
-      setSource("");
     }
     setNotice(
       reset
@@ -438,22 +454,24 @@ function App() {
     }, offset));
   }
   function moveAll() {
-    if (locked.current || !source || bulkBlockers.length || !groupsToMove.length) return;
+    if (locked.current || bulkBlockers.length || !groupsToMove.length) return;
     locked.current = true;
     const started: BulkProgress = {
-      id: ++sequence.current, source, destinations: { ...destinations },
+      id: ++sequence.current,
+      sources: Object.fromEntries(groupsToMove.map((item) => [item.id, item.instances.find((instance) => instance.role === "master")!.dc])),
+      destinations: { ...destinations },
       groupIds: groupsToMove.map((item) => item.id), completed: 0, stage: "check", step: 0,
     };
     setBulkProgress(started);
-    const routes = started.groupIds.map((id) => `${id} → ЦОД ${started.destinations[id]}`).join(", ");
+    const routes = started.groupIds.map((id) => `${id}: ЦОД ${started.sources[id]} → ЦОД ${started.destinations[id]}`).join(", ");
     const event: SimpleEvent = {
       kind: "bulk", id: started.id,
       time: new Date().toLocaleTimeString("ru-RU"), group: "Массовое перемещение",
-      description: `Из ЦОД ${source}: ${routes}. 0 из ${started.groupIds.length} групп`,
+      description: `${routes}. 0 из ${started.groupIds.length} групп`,
       status: "running",
     };
     setHistory((items) => [event, ...items]);
-    setNotice(`Проверка ${started.groupIds.length} групп перед перемещением из ЦОД ${source} по выбранным маршрутам.`);
+    setNotice(`Проверка ${started.groupIds.length} групп перед применением нового распределения.`);
     let groupStart = randomStepDuration();
     timers.current = started.groupIds.flatMap((groupId, index) => {
       const offsets = stageOffsets(stages.length);
@@ -471,12 +489,12 @@ function App() {
         const done = completed === started.groupIds.length;
         setBulkProgress({ ...started, completed, stage: done ? "done" : "moving", step: done ? stages.length : 0 });
         setHistory((items) => items.map((item) => item.id === started.id ? {
-          ...event, description: `Из ЦОД ${source}: ${routes}. ${completed} из ${started.groupIds.length} групп`,
+          ...event, description: `${routes}. ${completed} из ${started.groupIds.length} групп`,
           status: done ? "success" : "running",
         } : item));
         if (done) {
           locked.current = false;
-          setNotice(`Перемещены мастера ${started.groupIds.length} групп из ЦОД ${source} по выбранным маршрутам.`);
+          setNotice(`Новое распределение применено: перемещены мастера ${started.groupIds.length} групп.`);
         }
       }, groupStart + offset));
       groupStart += offsets[stages.length];
@@ -646,67 +664,14 @@ function App() {
 
       <section className="bulk-section" aria-labelledby="bulk-title">
         <div>
-          <h2 id="bulk-title" className="prose">Переместить мастера между ЦОД</h2>
-          <p>Выберите исходный ЦОД, затем целевой ЦОД для каждого мастера. Перед началом проверяются все затронутые группы.</p>
+          <h2 id="bulk-title">Массовое перемещение</h2>
+          <p>Составьте новое распределение мастеров в матрице и примените его по очереди.</p>
         </div>
-        <div className="bulk-controls">
-          <label htmlFor="bulk-source">1. Из ЦОД</label>
-          <select id="bulk-source" className={source ? `dc-color dc-${source}` : undefined} value={source} disabled={busy}
-            onChange={(event) => { setSource(event.target.value as DataCenter | ""); setDestinations({}); setBulkProgress(null); }}>
-            <option value="">Выберите исходный ЦОД</option>
-            {centers.map((dc) => <option className={`dc-color dc-${dc}`} key={dc} value={dc}>ЦОД {dc}</option>)}
-          </select>
-        </div>
-        {!bulkProgress && groupsToMove.length > 0 && <div className="bulk-plan">
-          <h3 className="prose">2. Куда переместить каждого мастера</h3>
-          <div className="bulk-routes">
-            {groupsToMove.map((item) => {
-              const currentMaster = item.instances.find((instance) => instance.role === "master")!;
-              const selectedReplica = item.instances.find((instance) => instance.dc === destinations[item.id]);
-              const blockers = source ? bulkMoveBlockers([item], source, destinations) : [];
-              return <div className="bulk-route" key={item.id}>
-                <div><strong>{item.id}</strong><p>Мастер №{instanceNumber(currentMaster.id)} · ЦОД {source}</p></div>
-                <div className="bulk-controls">
-                  <label className="prose" htmlFor={`bulk-destination-${item.id}`}>В ЦОД для {item.id}</label>
-                  <select id={`bulk-destination-${item.id}`} className={destinations[item.id] ? `dc-color dc-${destinations[item.id]}${selectedReplica && ineligibleReason(selectedReplica) ? " prose" : ""}` : undefined} value={destinations[item.id] ?? ""} disabled={busy}
-                    onChange={(event) => {
-                      const dc = event.target.value as DataCenter | "";
-                      setDestinations((current) => ({ ...current, [item.id]: dc || undefined }));
-                    }}>
-                    <option value="">Выберите целевой ЦОД</option>
-                    {item.instances.filter((instance) => instance.dc !== source).map((instance) =>
-                      <option className={`dc-color dc-${instance.dc}${ineligibleReason(instance) ? " prose" : ""}`} key={instance.dc} value={instance.dc}>ЦОД {instance.dc} · №{instanceNumber(instance.id)}{ineligibleReason(instance) ? ` — ${ineligibleReason(instance)}` : ""}</option>,
-                    )}
-                  </select>
-                </div>
-                {destinations[item.id] && blockers.length > 0 && <p className="inline-error bulk-route-error">{blockers.join("; ")}</p>}
-              </div>;
-            })}
-          </div>
-          <div className="bulk-start">
-            <p>{selectedDestinations === groupsToMove.length
-              ? bulkBlockers.length ? "Исправьте маршруты: одна или несколько групп не готовы к перемещению." : `Назначения выбраны для всех групп (${groupsToMove.length}). Можно начать перемещение.`
-              : `Выбраны назначения: ${selectedDestinations} из ${groupsToMove.length}. Укажите целевой ЦОД для каждого мастера.`}</p>
-            <button className="button primary" disabled={busy || bulkBlockers.length > 0}
-              onClick={moveAll}>3. Начать перемещение</button>
-          </div>
-        </div>}
-        {!bulkProgress && source && groupsToMove.length === 0 && <p className="bulk-feedback">В ЦОД {source} сейчас нет мастеров.</p>}
-        {bulkProgress && <div className="bulk-progress" role="status" aria-live="polite">
-          <strong>{bulkProgress.stage === "check" ? "Проверка всех целевых реплик" :
-            bulkProgress.stage === "done" ? "Перемещение завершено" :
-              `${bulkProgress.groupIds[bulkProgress.completed]}: ${bulkProgress.completed} из ${bulkProgress.groupIds.length} групп перемещено`}</strong>
-          <ol className="bulk-group-list">
-            {bulkProgress.groupIds.map((id, index) => <li key={id} className={index < bulkProgress.completed ? "completed" : index === bulkProgress.completed && bulkProgress.stage === "moving" ? "current" : ""}>
-              <span>{id} · ЦОД {bulkProgress.source} → ЦОД {bulkProgress.destinations[id]}</span><span>{index < bulkProgress.completed ? "Готово" :
-                index === bulkProgress.completed && bulkProgress.stage === "moving" ? stages[bulkProgress.step] : "Ожидание"}</span>
-            </li>)}
-          </ol>
-          {bulkProgress.stage === "moving" && <div className="bulk-stage-details">
-            <strong>Этапы переключения {bulkProgress.groupIds[bulkProgress.completed]}</strong>
-            <StageList labels={stages} step={bulkProgress.step} />
-          </div>}
-        </div>}
+        <button className="button primary" disabled={busy && !bulkProgress}
+          onClick={() => setMigrationOpen(true)}>
+          {bulkProgress && bulkProgress.stage !== "done" ? "Показать прогресс" : "Распределение мастеров"}
+        </button>
+        {bulkProgress && <p className="bulk-feedback">{bulkProgress.stage === "done" ? "Распределение применено" : "Выполняется перемещение"} · {bulkProgress.completed} из {bulkProgress.groupIds.length} групп</p>}
       </section>
 
       <section className="summary" aria-label="Сводка по всей системе">
@@ -955,6 +920,74 @@ function App() {
       <div className="sr-only" role="status" aria-live="polite">
         {notice}
       </div>
+
+      <dialog ref={migrationDialog} className="migration-dialog" aria-labelledby="migration-title"
+        onCancel={(event) => { event.preventDefault(); setMigrationOpen(false); }}>
+        <div className="panel-header">
+          <div><span className="eyebrow">Массовое перемещение · симуляция</span><h2 id="migration-title">Распределение мастеров</h2></div>
+          <button className="icon-button close-panel" aria-label="Закрыть распределение" onClick={() => setMigrationOpen(false)}><Icon name="close" size={22} /></button>
+        </div>
+        <div className="migration-body">
+          <p className="muted">Выберите будущего мастера в каждой строке. Выбор меняет только план; переносы начнутся после запуска.</p>
+          <div className="migration-legend"><span>● Текущий мастер</span><span>✓ Мастер по плану</span><span>Недоступные цели отмечены причиной</span></div>
+          <div className="distribution-summary" aria-label="Распределение по ЦОД">
+            {centers.map((dc) => {
+              const current = groups.filter((item) => item.instances.some((instance) => instance.role === "master" && instance.dc === dc)).length;
+              const planned = groups.filter((item) => (destinations[item.id] ?? item.instances.find((instance) => instance.role === "master")?.dc) === dc).length;
+              return <div key={dc} className={`dc-color dc-${dc}`}><strong>ЦОД {dc}</strong><span>{current} → {planned} мастеров</span></div>;
+            })}
+          </div>
+          <div className="migration-matrix" role="table" aria-label="План мастеров: 12 групп, 3 ЦОД">
+            <div className="matrix-row matrix-heading" role="row"><span role="columnheader">Группа</span>{centers.map((dc) => <span role="columnheader" key={dc} className={`dc-color dc-${dc}`}>ЦОД {dc}</span>)}</div>
+            {groups.map((item) => {
+              const currentMaster = item.instances.find((instance) => instance.role === "master")!;
+              const plannedDc = destinations[item.id] ?? currentMaster.dc;
+              const queueIndex = bulkProgress?.groupIds.indexOf(item.id) ?? -1;
+              const completed = queueIndex >= 0 && !!bulkProgress && queueIndex < bulkProgress.completed;
+              const active = queueIndex >= 0 && bulkProgress?.stage === "moving" && queueIndex === bulkProgress.completed;
+              return <div className={`matrix-row ${active ? "matrix-active" : ""}`} role="row" key={item.id}>
+                <strong role="rowheader">{item.id}<small>{completed ? "Готово" : active ? "Перенос…" : plannedDc !== currentMaster.dc ? `${currentMaster.dc} → ${plannedDc}` : "Без изменений"}</small></strong>
+                {item.instances.map((instance) => {
+                  const isCurrent = instance.role === "master";
+                  const selected = plannedDc === instance.dc;
+                  const reason = isCurrent ? null : !currentMaster.available ? "Текущий мастер недоступен" : ineligibleReason(instance);
+                  const status = instanceStatus(instance, activeTransfer);
+                  return <div role="cell" key={instance.id}><button
+                    className={`matrix-cell dc-color dc-${instance.dc} ${selected ? "matrix-selected" : ""} ${reason ? "matrix-blocked" : ""}`}
+                    aria-pressed={selected} aria-label={`${item.id}, ЦОД ${instance.dc}, №${instanceNumber(instance.id)}${isCurrent ? ", текущий мастер" : ""}${reason ? `, ${reason}` : ""}`}
+                    disabled={busy} title={reason ?? "Выбрать мастером по плану"}
+                    onClick={() => selectDestination(item.id, instance.dc)}>
+                    <span className="matrix-cell-top"><strong>№{instanceNumber(instance.id)}</strong><span>{isCurrent && <span aria-label="Текущий мастер">● </span>}{selected && <span aria-label="Мастер по плану">✓</span>}</span></span>
+                    <span className="matrix-cell-status">{status}</span>
+                    {reason && <span className="matrix-cell-reason">{reason}</span>}
+                  </button></div>;
+                })}
+              </div>;
+            })}
+          </div>
+          {bulkBlockers.length > 0 && !busy && <div className="error-box" role="alert"><strong>План не готов к запуску</strong>{bulkBlockers.map((reason) => <p key={reason}>{reason}</p>)}</div>}
+        {bulkProgress && <div className="bulk-progress" role="status" aria-live="polite">
+          <strong>{bulkProgress.stage === "check" ? "Проверка всех целевых реплик" :
+            bulkProgress.stage === "done" ? "Перемещение завершено" :
+              `${bulkProgress.groupIds[bulkProgress.completed]}: ${bulkProgress.completed} из ${bulkProgress.groupIds.length} групп перемещено`}</strong>
+          <ol className="bulk-group-list">
+            {bulkProgress.groupIds.map((id, index) => <li key={id} className={index < bulkProgress.completed ? "completed" : index === bulkProgress.completed && bulkProgress.stage === "moving" ? "current" : ""}>
+              <span>{id} · ЦОД {bulkProgress.sources[id]} → ЦОД {bulkProgress.destinations[id]}</span><span>{index < bulkProgress.completed ? "Готово" :
+                index === bulkProgress.completed && bulkProgress.stage === "moving" ? stages[bulkProgress.step] : "Ожидание"}</span>
+            </li>)}
+          </ol>
+          {bulkProgress.stage === "moving" && <div className="bulk-stage-details">
+            <strong>Этапы переключения {bulkProgress.groupIds[bulkProgress.completed]}</strong>
+            <StageList labels={stages} step={bulkProgress.step} />
+          </div>}
+        </div>}
+          <div className="migration-footer">
+            <p>{busy ? "Переносы выполняются по одному. Панель можно закрыть." : groupsToMove.length ? `К перемещению: ${groupsToMove.length} из 12 групп` : "Все мастера остаются на своих местах."}</p>
+            <div className="migration-actions"><button className="button" disabled={busy} onClick={editDistribution}>Сбросить план</button>
+              <button className="button primary" disabled={busy || !groupsToMove.length || !!bulkBlockers.length} onClick={moveAll}>Начать перемещение</button></div>
+          </div>
+        </div>
+      </dialog>
 
       <dialog
         ref={dialog}

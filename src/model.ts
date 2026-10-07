@@ -102,32 +102,23 @@ export function setReplicaEnabled(
 
 export type BulkDestinations = Partial<Record<string, DataCenter>>;
 
-export function groupsMasteredIn(groups: Group[], source: DataCenter): Group[] {
-  return groups.filter((group) =>
-    group.instances.some((instance) => instance.dc === source && instance.role === "master"),
-  );
-}
-
-export function bulkMoveBlockers(groups: Group[], source: DataCenter, destinations: BulkDestinations): string[] {
-  return groupsMasteredIn(groups, source).flatMap((group) => {
-    const destination = destinations[group.id];
-    if (!destination) return [`${group.id}: выберите целевой ЦОД`];
-    if (source === destination) return [`${group.id}: целевой ЦОД совпадает с исходным`];
+// Missing destinations keep the current master; only changed groups enter the queue.
+export function distributionMoves(groups: Group[], destinations: BulkDestinations): Group[] {
+  return groups.filter((group) => {
     const master = group.instances.find((instance) => instance.role === "master");
-    const target = group.instances.find((instance) => instance.dc === destination);
-    if (!target) return [`${group.id}: нет экземпляра в ЦОД ${destination}`];
-    if (!master?.available) return [`${group.id}: текущий мастер недоступен`];
-    const reason = ineligibleReason(target);
-    return reason ? [`${group.id}: ${reason.toLowerCase()}`] : [];
+    return destinations[group.id] && destinations[group.id] !== master?.dc;
   });
 }
 
-export function moveAllMasters(groups: Group[], source: DataCenter, destinations: BulkDestinations): Group[] {
-  if (bulkMoveBlockers(groups, source, destinations).length) return groups;
-  return groupsMasteredIn(groups, source).reduce((current, group) => {
-    const target = group.instances.find((instance) => instance.dc === destinations[group.id])!;
-    return switchMaster(current, group.id, target.id);
-  }, groups);
+export function distributionBlockers(groups: Group[], destinations: BulkDestinations): string[] {
+  return distributionMoves(groups, destinations).flatMap((group) => {
+    const master = group.instances.find((instance) => instance.role === "master");
+    const target = group.instances.find((instance) => instance.dc === destinations[group.id]);
+    if (!master?.available) return [`${group.id}: текущий мастер недоступен`];
+    if (!target) return [`${group.id}: нет целевого экземпляра`];
+    const reason = ineligibleReason(target);
+    return reason ? [`${group.id}: ${reason.toLowerCase()}`] : [];
+  });
 }
 
 export function matchesSearch(group: Group, query: string): boolean {
